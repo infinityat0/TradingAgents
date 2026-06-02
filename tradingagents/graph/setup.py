@@ -1,5 +1,7 @@
 # TradingAgents/graph/setup.py
 
+import logging
+import time
 from typing import Any, Dict
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
@@ -9,6 +11,34 @@ from tradingagents.agents.utils.agent_states import AgentState
 
 from .analyst_execution import build_analyst_execution_plan
 from .conditional_logic import ConditionalLogic
+from .rate_limit import make_retry_wrapper
+
+logger = logging.getLogger(__name__)
+
+
+def _make_delay_wrapper(node_fn, delay_seconds: float, state_key: str):
+    """Wrap a node function to pause before executing on any turn after the first.
+
+    Uses ``state[state_key]["count"]`` to detect subsequent turns: count == 0
+    means the debate hasn't started yet, so no delay is inserted.  Every later
+    turn (count > 0) sleeps for ``delay_seconds`` before invoking the node,
+    giving the upstream API time to replenish its rate-limit quota.
+    """
+    if delay_seconds <= 0:
+        return node_fn
+
+    def wrapper(state):
+        count = (state.get(state_key) or {}).get("count", 0)
+        if count > 0:
+            logger.info(
+                "Sleeping %.0fs before researcher turn %d (rate-limit guard)...",
+                delay_seconds,
+                count,
+            )
+            time.sleep(delay_seconds)
+        return node_fn(state)
+
+    return wrapper
 
 
 class GraphSetup:
@@ -21,6 +51,8 @@ class GraphSetup:
         tool_nodes: Dict[str, ToolNode],
         conditional_logic: ConditionalLogic,
         analyst_concurrency_limit: int = 1,
+        researcher_delay_seconds: float = 0,
+        node_max_retries: int = 3,
     ):
         """Initialize with required components."""
         self.quick_thinking_llm = quick_thinking_llm
@@ -28,6 +60,8 @@ class GraphSetup:
         self.tool_nodes = tool_nodes
         self.conditional_logic = conditional_logic
         self.analyst_concurrency_limit = analyst_concurrency_limit
+        self.researcher_delay_seconds = researcher_delay_seconds
+        self.node_max_retries = node_max_retries
 
     def setup_graph(
         self, selected_analysts=["market", "social", "news", "fundamentals"]
@@ -46,24 +80,53 @@ class GraphSetup:
             concurrency_limit=self.analyst_concurrency_limit,
         )
 
+        delay = self.researcher_delay_seconds
+        retries = self.node_max_retries
+
+        def _retry(fn):
+            return make_retry_wrapper(fn, retries)
+
+        def _delay_retry(fn, state_key):
+            # Composition: proactive turn delay fires once, reactive retry
+            # delay fires only between attempts on 429.
+            return _make_delay_wrapper(_retry(fn), delay, state_key)
+
         analyst_factories = {
-            "market": lambda: create_market_analyst(self.quick_thinking_llm),
-            "social": lambda: create_sentiment_analyst(self.quick_thinking_llm),
-            "news": lambda: create_news_analyst(self.quick_thinking_llm),
-            "fundamentals": lambda: create_fundamentals_analyst(self.quick_thinking_llm),
+            "market": lambda: _retry(create_market_analyst(self.quick_thinking_llm)),
+            "social": lambda: _retry(create_sentiment_analyst(self.quick_thinking_llm)),
+            "news": lambda: _retry(create_news_analyst(self.quick_thinking_llm)),
+            "fundamentals": lambda: _retry(create_fundamentals_analyst(self.quick_thinking_llm)),
         }
 
-        # Create researcher and manager nodes
-        bull_researcher_node = create_bull_researcher(self.quick_thinking_llm)
-        bear_researcher_node = create_bear_researcher(self.quick_thinking_llm)
-        research_manager_node = create_research_manager(self.deep_thinking_llm)
-        trader_node = create_trader(self.quick_thinking_llm)
+        # Researcher nodes: proactive turn delay + retry on 429.
+        # Bull starts first (count == 0) so it gets no proactive delay;
+        # every subsequent turn sleeps to avoid hitting per-minute quotas.
+        bull_researcher_node = _delay_retry(
+            create_bull_researcher(self.quick_thinking_llm),
+            "investment_debate_state",
+        )
+        bear_researcher_node = _delay_retry(
+            create_bear_researcher(self.quick_thinking_llm),
+            "investment_debate_state",
+        )
+        research_manager_node = _retry(create_research_manager(self.deep_thinking_llm))
+        trader_node = _retry(create_trader(self.quick_thinking_llm))
 
-        # Create risk analysis nodes
-        aggressive_analyst = create_aggressive_debator(self.quick_thinking_llm)
-        neutral_analyst = create_neutral_debator(self.quick_thinking_llm)
-        conservative_analyst = create_conservative_debator(self.quick_thinking_llm)
-        portfolio_manager_node = create_portfolio_manager(self.deep_thinking_llm)
+        # Risk analysis nodes: same delay + retry pattern.
+        # Aggressive starts first (count == 0, no delay).
+        aggressive_analyst = _delay_retry(
+            create_aggressive_debator(self.quick_thinking_llm),
+            "risk_debate_state",
+        )
+        neutral_analyst = _delay_retry(
+            create_neutral_debator(self.quick_thinking_llm),
+            "risk_debate_state",
+        )
+        conservative_analyst = _delay_retry(
+            create_conservative_debator(self.quick_thinking_llm),
+            "risk_debate_state",
+        )
+        portfolio_manager_node = _retry(create_portfolio_manager(self.deep_thinking_llm))
 
         # Create workflow
         workflow = StateGraph(AgentState)

@@ -15,8 +15,10 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_OUTPUT_LANGUAGE":      "output_language",
     "TRADINGAGENTS_MAX_DEBATE_ROUNDS":    "max_debate_rounds",
     "TRADINGAGENTS_MAX_RISK_ROUNDS":      "max_risk_discuss_rounds",
-    "TRADINGAGENTS_CHECKPOINT_ENABLED":   "checkpoint_enabled",
-    "TRADINGAGENTS_BENCHMARK_TICKER":     "benchmark_ticker",
+    "TRADINGAGENTS_CHECKPOINT_ENABLED":      "checkpoint_enabled",
+    "TRADINGAGENTS_BENCHMARK_TICKER":        "benchmark_ticker",
+    "TRADINGAGENTS_RESEARCHER_DELAY_SECS":  "researcher_delay_seconds",
+    "TRADINGAGENTS_NODE_MAX_RETRIES":       "node_max_retries",
 }
 
 
@@ -75,6 +77,14 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "max_risk_discuss_rounds": 1,
     "max_recur_limit": 100,
     "analyst_concurrency_limit": 1,
+    # Seconds to sleep before each researcher/risk-debater turn after the first.
+    # Set to 0 to disable. Useful when providers impose per-minute token quotas
+    # that cause mid-debate failures; the delay lets the quota window reset.
+    "researcher_delay_seconds": 60,
+    # Max LLM call attempts per node before the exception propagates.
+    # On each retry the node sleeps for the delay suggested by the provider
+    # (parsed from the 429 / RESOURCE_EXHAUSTED response).
+    "node_max_retries": 3,
     # News / data fetching parameters
     # Increase for longer lookback strategies or to broaden macro coverage;
     # decrease to reduce token usage in agent prompts.

@@ -115,6 +115,8 @@ class TradingAgentsGraph:
             self.tool_nodes,
             self.conditional_logic,
             analyst_concurrency_limit=self.config.get("analyst_concurrency_limit", 1),
+            researcher_delay_seconds=self.config.get("researcher_delay_seconds", 0),
+            node_max_retries=self.config.get("node_max_retries", 3),
         )
 
         self.propagator = Propagator(
@@ -334,7 +336,15 @@ class TradingAgentsGraph:
                 self.graph = self.workflow.compile()
 
     def _run_graph(self, company_name, trade_date, asset_type: str = "stock"):
-        """Execute the graph and write the resulting state to disk and memory log."""
+        """Execute the graph and write the resulting state to disk and memory log.
+
+        Always uses streaming so that each completed analyst/researcher report
+        is flushed to the JSON log file as soon as it is available.  If the run
+        crashes mid-way (e.g. due to an API outage), the file on disk contains
+        everything that was produced up to that point.  Combined with
+        ``checkpoint_enabled``, the next run resumes from the last successful
+        node and continues filling in the same file.
+        """
         # Initialize state — inject memory log context for PM.
         past_context = self.memory_log.get_past_context(company_name)
         init_agent_state = self.propagator.create_initial_state(
@@ -347,26 +357,20 @@ class TradingAgentsGraph:
             tid = thread_id(company_name, str(trade_date))
             args.setdefault("config", {}).setdefault("configurable", {})["thread_id"] = tid
 
-        if self.debug:
-            trace = []
-            for chunk in self.graph.stream(init_agent_state, **args):
-                if len(chunk["messages"]) == 0:
-                    pass
-                else:
-                    chunk["messages"][-1].pretty_print()
-                    trace.append(chunk)
-            # Streamed chunks are per-node deltas. Merge them so the returned
-            # state matches what graph.invoke() yields in the non-debug path.
-            final_state = {}
-            for chunk in trace:
-                final_state.update(chunk)
-        else:
-            final_state = self.graph.invoke(init_agent_state, **args)
+        # Stream through every node, saving partial state to disk after each one.
+        # Each chunk from stream_mode="values" is the complete AgentState at that
+        # point, so the last chunk equals what graph.invoke() would have returned.
+        final_state = {}
+        for chunk in self.graph.stream(init_agent_state, **args):
+            if self.debug and chunk.get("messages"):
+                chunk["messages"][-1].pretty_print()
+            final_state = chunk
+            self._save_partial_state(trade_date, chunk)
 
         # Store current state for reflection.
         self.curr_state = final_state
 
-        # Log state to disk.
+        # Update the in-memory dict (file already written by the streaming loop).
         self._log_state(trade_date, final_state)
 
         # Store decision for deferred reflection on the next same-ticker run.
@@ -384,47 +388,86 @@ class TradingAgentsGraph:
 
         return final_state, self.process_signal(final_state["final_trade_decision"])
 
-    def _log_state(self, trade_date, final_state):
-        """Log the final state to a JSON file."""
-        self.log_states_dict[str(trade_date)] = {
-            "company_of_interest": final_state["company_of_interest"],
-            "trade_date": final_state["trade_date"],
-            "market_report": final_state["market_report"],
-            "sentiment_report": final_state["sentiment_report"],
-            "news_report": final_state["news_report"],
-            "fundamentals_report": final_state["fundamentals_report"],
-            "investment_debate_state": {
-                "bull_history": final_state["investment_debate_state"]["bull_history"],
-                "bear_history": final_state["investment_debate_state"]["bear_history"],
-                "history": final_state["investment_debate_state"]["history"],
-                "current_response": final_state["investment_debate_state"][
-                    "current_response"
-                ],
-                "judge_decision": final_state["investment_debate_state"][
-                    "judge_decision"
-                ],
-            },
-            "trader_investment_decision": final_state["trader_investment_plan"],
-            "risk_debate_state": {
-                "aggressive_history": final_state["risk_debate_state"]["aggressive_history"],
-                "conservative_history": final_state["risk_debate_state"]["conservative_history"],
-                "neutral_history": final_state["risk_debate_state"]["neutral_history"],
-                "history": final_state["risk_debate_state"]["history"],
-                "judge_decision": final_state["risk_debate_state"]["judge_decision"],
-            },
-            "investment_plan": final_state["investment_plan"],
-            "final_trade_decision": final_state["final_trade_decision"],
-        }
+    def _save_partial_state(self, trade_date, state):
+        """Flush the current pipeline state to the report JSON.
 
-        # Save to file. Reject ticker values that would escape the
-        # results directory when joined as a path component.
+        Called after every streamed node so that each completed analyst or
+        researcher report lands on disk immediately.  The file is overwritten
+        on each call; the last call (after Portfolio Manager) produces the
+        same content that the old end-of-run _log_state write would have.
+        """
         safe_ticker = safe_ticker_component(self.ticker)
-        directory = Path(self.config["results_dir"]) / safe_ticker / "TradingAgentsStrategy_logs"
+        directory = (
+            Path(self.config["results_dir"]) / safe_ticker / "TradingAgentsStrategy_logs"
+        )
         directory.mkdir(parents=True, exist_ok=True)
+
+        debate = state.get("investment_debate_state") or {}
+        risk = state.get("risk_debate_state") or {}
+
+        snapshot = {
+            "company_of_interest": state.get("company_of_interest", ""),
+            "trade_date": state.get("trade_date", ""),
+            "market_report": state.get("market_report", ""),
+            "sentiment_report": state.get("sentiment_report", ""),
+            "news_report": state.get("news_report", ""),
+            "fundamentals_report": state.get("fundamentals_report", ""),
+            "investment_debate_state": {
+                "bull_history": debate.get("bull_history", ""),
+                "bear_history": debate.get("bear_history", ""),
+                "history": debate.get("history", ""),
+                "current_response": debate.get("current_response", ""),
+                "judge_decision": debate.get("judge_decision", ""),
+            },
+            "trader_investment_decision": state.get("trader_investment_plan", ""),
+            "risk_debate_state": {
+                "aggressive_history": risk.get("aggressive_history", ""),
+                "conservative_history": risk.get("conservative_history", ""),
+                "neutral_history": risk.get("neutral_history", ""),
+                "history": risk.get("history", ""),
+                "judge_decision": risk.get("judge_decision", ""),
+            },
+            "investment_plan": state.get("investment_plan", ""),
+            "final_trade_decision": state.get("final_trade_decision", ""),
+        }
 
         log_path = directory / f"full_states_log_{trade_date}.json"
         with open(log_path, "w", encoding="utf-8") as f:
-            json.dump(self.log_states_dict[str(trade_date)], f, indent=4)
+            json.dump(snapshot, f, indent=4)
+
+    def _log_state(self, trade_date, final_state):
+        """Update the in-memory state dict from the completed final state.
+
+        File I/O is handled by _save_partial_state (called after every
+        streaming chunk), so this method only maintains log_states_dict.
+        """
+        debate = final_state.get("investment_debate_state") or {}
+        risk = final_state.get("risk_debate_state") or {}
+        self.log_states_dict[str(trade_date)] = {
+            "company_of_interest": final_state.get("company_of_interest", ""),
+            "trade_date": final_state.get("trade_date", ""),
+            "market_report": final_state.get("market_report", ""),
+            "sentiment_report": final_state.get("sentiment_report", ""),
+            "news_report": final_state.get("news_report", ""),
+            "fundamentals_report": final_state.get("fundamentals_report", ""),
+            "investment_debate_state": {
+                "bull_history": debate.get("bull_history", ""),
+                "bear_history": debate.get("bear_history", ""),
+                "history": debate.get("history", ""),
+                "current_response": debate.get("current_response", ""),
+                "judge_decision": debate.get("judge_decision", ""),
+            },
+            "trader_investment_decision": final_state.get("trader_investment_plan", ""),
+            "risk_debate_state": {
+                "aggressive_history": risk.get("aggressive_history", ""),
+                "conservative_history": risk.get("conservative_history", ""),
+                "neutral_history": risk.get("neutral_history", ""),
+                "history": risk.get("history", ""),
+                "judge_decision": risk.get("judge_decision", ""),
+            },
+            "investment_plan": final_state.get("investment_plan", ""),
+            "final_trade_decision": final_state.get("final_trade_decision", ""),
+        }
 
     def process_signal(self, full_signal):
         """Process a signal to extract the core decision."""
